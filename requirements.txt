@@ -1,0 +1,27 @@
+# Основной фреймворк для агента
+langchain>=0.2.1
+langchain-core>=0.2.3
+langchain-openai>=0.1.7
+langchain-gigachat>=0.1.5
+langgraph>=0.1.1
+
+# Асинхронность и HTTP
+httpx>=0.24.0
+httpcore>=0.17.0
+
+# Тестирование
+pytest>=8.0.0
+pytest-asyncio
+
+# Для Telegram
+python-telegram-bot
+
+# Для работы с .env
+python-dotenv
+
+# Валидация данных
+pydantic
+
+# Вспомогательные
+cachetools
+requests
