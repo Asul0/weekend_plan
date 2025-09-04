@@ -13,11 +13,23 @@ class PossibleActions(str, Enum):
     BUILD_PLAN = "BUILD_PLAN"
     ANALYZE_FEEDBACK = "ANALYZE_FEEDBACK"
     PRESENT_RESULTS = "PRESENT_RESULTS"
-    GEOCODE_ADDRESS = "GEOCODE_ADDRESS"
     CLARIFY_OR_CHITCHAT = "CLARIFY_OR_CHITCHAT"
     REFINE_PLAN = "REFINE_PLAN"
     DELETE_ACTIVITY = "DELETE_ACTIVITY"
     ADD_ACTIVITY = "ADD_ACTIVITY"
+    PROCESS_START_ADDRESS = "PROCESS_START_ADDRESS"
+
+
+class RouteSegment(BaseModel):
+    """Представляет один отрезок маршрута от одной точки до другой."""
+    model_config = ConfigDict(extra="ignore")
+
+    from_name: str = Field(description="Название начальной точки.")
+    to_name: str = Field(description="Название конечной точки.")
+    duration_seconds: int = Field(description="Длительность поездки в секундах.")
+    distance_meters: float = Field(description="Расстояние в метрах.")
+    from_coords: Optional[Dict[str, float]] = Field(None, description="Координаты начальной точки.")
+    to_coords: Optional[Dict[str, float]] = Field(None, description="Координаты конечной точки.")
 
 
 # Файл: src/schemas/data_schemas.py

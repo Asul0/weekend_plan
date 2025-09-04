@@ -13,7 +13,6 @@ from src.schemas.data_schemas import (
     Plan,
     AnalyzedFeedback,
     ClassifiedIntent,
-    UserIntent,
 )
 from typing import TypedDict, Optional, Literal
 
@@ -60,3 +59,5 @@ class AgentState(TypedDict):
     user_start_coordinates: Optional[dict]
     is_awaiting_address: bool
     status_message_id: Optional[Any]
+    user_start_address: Optional[str]        # <-- ДОБАВЛЕНО
+    is_awaiting_start_address: bool

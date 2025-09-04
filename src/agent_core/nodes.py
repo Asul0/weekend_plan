@@ -1,4 +1,3 @@
-# Файл: src/agent_core/nodes.py (ФИНАЛЬНАЯ ЭТАЛОННАЯ ВЕРСИЯ)
 import logging
 import asyncio
 import json
@@ -7,12 +6,11 @@ from pydantic import BaseModel, Field
 from datetime import datetime, timedelta
 from typing import List, Optional, Union
 from src.agent_core.command_processor import CommandProcessor
-from src.schemas.data_schemas import (  # <-- ИЗМЕНИТЬ ЭТОТ БЛОК
+from src.schemas.data_schemas import (
     ExtractedInitialInfo,
     Event,
     ParkInfo,
     PlanItem,
-    FlatFeedback,
     Constraint,
     FoodPlaceInfo,
     AnalyzedFeedback,
@@ -25,18 +23,19 @@ from src.schemas.data_schemas import (  # <-- ИЗМЕНИТЬ ЭТОТ БЛОК
     ChangeRequest,
     SemanticConstraint,
     ClassifiedIntent,
-    LlmExtractionResult,
+    RouteSegment,
 )
 from src.tools.datetime_parser_tool import datetime_parser_tool
 from src.tools.gis_tools import park_search_tool, food_place_search_tool
-from src.services.gis_service import get_geocoding_details
+from src.services.gis_service import get_geocoding_details, get_route
 from src.agent_core.state import AgentState
 from src.gigachat_client import get_gigachat_client
 from src.services.afisha_service import fetch_cities
-from src.tools.datetime_parser_tool import datetime_parser_tool
 from src.tools.event_search_tool import event_search_tool
 from langchain_core.messages import HumanMessage, AIMessage
 from src.utils.callbacks import TokenUsageCallbackHandler
+
+logger = logging.getLogger(__name__)
 
 logger = logging.getLogger(__name__)
 
@@ -95,7 +94,6 @@ async def classify_intent_node(state: AgentState) -> AgentState:
 Проанализируй следующий запрос пользователя и верни JSON с категорией намерения.
 **Запрос:** "{user_query}"
 """
-    # --- КОНЕЦ БЛОКА ДЛЯ ЗАМЕНЫ ---
 
     try:
         # Проверяем, есть ли в state уже предложенный план. Это важный контекст.
@@ -522,7 +520,7 @@ async def prepare_and_search_events_node(state: AgentState) -> AgentState:
 
 async def handle_clarification_node(state: AgentState) -> AgentState:
     """
-    Обрабатывает ответ пользователя на уточняющий вопрос. (ИСПРАВЛЕННАЯ ВЕРСИЯ)
+    Обрабатывает ответ пользователя на уточняющий вопрос.
     """
     logger.info("--- УЗЕЛ: handle_clarification_node ---")
     user_response = state.get("user_message")
@@ -533,37 +531,138 @@ async def handle_clarification_node(state: AgentState) -> AgentState:
         logger.info(
             f"Получен ответ для уточнения города: '{user_response}'. Обновляю критерии."
         )
-
-        # --- КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ ---
-        # Обращаемся к 'search_criteria' как к объекту, а не словарю.
         if criteria:
             criteria.city = user_response.strip()
         else:
-            # На случай, если критерии не были созданы, создаем их.
             state["search_criteria"] = ExtractedInitialInfo(city=user_response.strip())
-        # --- КОНЕЦ ИСПРАВЛЕНИЯ ---
-
-        # Сбрасываем флаг ожидания и ошибку, чтобы граф мог двигаться дальше
         state["is_awaiting_clarification"] = None
         state["error"] = None
 
     return state
 
 
-async def router_node(state: AgentState) -> AgentState:
+async def process_start_address_node(state: AgentState) -> AgentState:
     """
-    Главный узел-оркестратор v8.0. ФИНАЛЬНАЯ ВЕРСИЯ.
-    Реализована защита от цикла и корректная обработка новых PLAN_REQUEST.
+    Узел для обработки стартового адреса.
+    Реализует логику "дополнения" маршрута к существующему плану.
     """
-    logger.info(
-        f"--- УЗЕЛ: router_node ---. Вход: plan={'Да' if state.get('current_plan') else 'Нет'}, queue={len(state.get('command_queue', []))}, intent={state.get('classified_intent').intent if state.get('classified_intent') else 'N/A'}"
+    logger.info("--- УЗЕЛ: process_start_address_node ---")
+    user_address = state.get("user_message", "").strip()
+    current_plan = state.get("current_plan")
+
+    # Сбрасываем флаг ожидания, так как мы обрабатываем ответ
+    state["is_awaiting_start_address"] = False
+
+    if not current_plan or not current_plan.items:
+        state["error"] = "Произошла ошибка, план не найден. Давайте начнем сначала."
+        return state
+
+    # Обработка случая, если пользователь пропустил ввод
+    if "пропустить" in user_address.lower():
+        logger.info(
+            "Пользователь пропустил ввод адреса. Финальный план будет без маршрута от дома."
+        )
+        state["user_start_address"] = "Точка старта не указана"
+        state["user_start_coordinates"] = None
+        # Если у первого элемента был маршрут, его нужно очистить,
+        # так как он был рассчитан от "гибкого" старта, а не от дома.
+        if current_plan.items and "travel_info_to_here" in current_plan.items[0]:
+            del current_plan.items[0]["travel_info_to_here"]
+        return state
+
+    # Основная логика: геокодирование и расчет маршрута
+    city = state.get("search_criteria").city if state.get("search_criteria") else None
+    if not city:
+        state["error"] = "Не могу определить город для поиска адреса."
+        return state
+
+    logger.info(f"Обрабатываю стартовый адрес: '{user_address}' в городе {city}")
+    geo_result = await get_geocoding_details(address=user_address, city=city)
+
+    if not geo_result or not geo_result.coords:
+        logger.warning(f"Не удалось геокодировать адрес: {user_address}")
+        state["user_start_address"] = f"{user_address} (адрес не найден)"
+        state["user_start_coordinates"] = None
+        # Очищаем маршрут до первого элемента, если он был, т.к. адрес не найден
+        if current_plan.items and "travel_info_to_here" in current_plan.items[0]:
+            del current_plan.items[0]["travel_info_to_here"]
+        return state
+
+    # Адрес успешно найден
+    state["user_start_address"] = geo_result.full_address_name_gis or user_address
+    state["user_start_coordinates"] = {
+        "lon": geo_result.coords[0],
+        "lat": geo_result.coords[1],
+    }
+    logger.info(f"Адрес успешно геокодирован: {state['user_start_address']}")
+
+    # Получаем координаты первого мероприятия из плана
+    first_item_dict = current_plan.items[0]
+    first_item_coords = None
+    if first_item_dict.get("coords"):
+        first_item_coords = {
+            "lon": first_item_dict["coords"][0],
+            "lat": first_item_dict["coords"][1],
+        }
+    elif first_item_dict.get("place_coords_lon"):
+        first_item_coords = {
+            "lon": first_item_dict["place_coords_lon"],
+            "lat": first_item_dict["place_coords_lat"],
+        }
+
+    if not first_item_coords:
+        logger.warning("Не удалось найти координаты первого мероприятия в плане.")
+        return state
+
+    # --- КЛЮЧЕВОЕ ИЗМЕНЕНИЕ ---
+    # Мы не просто создаем новый сегмент, мы ОБНОВЛЯЕМ существующий
+    # (или добавляем, если его не было).
+    logger.info("Рассчитываю маршрут от дома до первого мероприятия.")
+    route_info = await get_route(
+        points=[state["user_start_coordinates"], first_item_coords]
     )
 
-    # Шаг 0: Очистка "одноразовых" полей
+    if route_info.get("status") == "success":
+        initial_segment = RouteSegment(
+            from_name=state["user_start_address"],
+            to_name=first_item_dict.get("name", "Первое мероприятие"),
+            duration_seconds=route_info.get("duration_seconds", 0),
+            distance_meters=route_info.get("distance_meters", 0),
+            from_coords=state["user_start_coordinates"],
+            to_coords=first_item_coords,
+        )
+        # Аккуратно заменяем или добавляем информацию о маршруте в первый элемент плана
+        current_plan.items[0]["travel_info_to_here"] = initial_segment.model_dump()
+        state["current_plan"] = current_plan
+        logger.info(
+            "Маршрут от дома успешно добавлен/обновлен в первом элементе плана."
+        )
+    else:
+        logger.warning(
+            f"Не удалось построить маршрут от дома до первого мероприятия. Ошибка: {route_info.get('message')}"
+        )
+        # Если маршрут не построился, лучше очистить travel_info, чтобы не было путаницы
+        if "travel_info_to_here" in current_plan.items[0]:
+            del current_plan.items[0]["travel_info_to_here"]
+
+    return state
+
+
+async def router_node(state: AgentState) -> AgentState:
+    """
+    Главный узел-оркестратор v8.2.
+    Логика проверки ожидания адреса вынесена на уровень графа,
+    поэтому этот узел стал проще и чище.
+    """
+    logger.info("--- УЗЕЛ: router_node ---")
+
+    # Очистка "одноразовых" полей
     state["last_structured_command"] = None
     state["error"] = None
+    # --- ИЗМЕНЕНИЕ: Убираем блок if state.get("is_awaiting_start_address") ---
+    # Эта логика теперь обрабатывается в графе до вызова роутера.
 
-    # --- ИЕРАРХИЯ ПРИНЯТИЯ РЕШЕНИЙ ---
+    # --- ИЕРАРХИЯ ПРИНЯТИЯ РЕШЕНИЙ (без изменений) ---
 
     # Приоритет 1: Новый запрос на ПОЛНОЕ перепланирование
     classified_intent = state.get("classified_intent")
@@ -577,20 +676,22 @@ async def router_node(state: AgentState) -> AgentState:
         state["current_plan"] = None
         state["pinned_items"] = {}
         state["plan_builder_result"] = None
-        state["classified_intent"] = None  # Сбрасываем интент
+        state["classified_intent"] = None
+        state["user_start_address"] = None
+        state["user_start_coordinates"] = None
+        state["is_awaiting_start_address"] = False
         state["next_action"] = PossibleActions.EXTRACT_CRITERIA
         return state
 
     # Приоритет 2: Новый ФИДБЕК на существующий план
     if classified_intent and classified_intent.intent == UserIntent.FEEDBACK_ON_PLAN:
         logger.info("Приоритет 2: Обнаружен FEEDBACK_ON_PLAN. -> ANALYZE_FEEDBACK")
-        state["classified_intent"] = None  # Сбрасываем интент
+        state["classified_intent"] = None
         state["next_action"] = PossibleActions.ANALYZE_FEEDBACK
         return state
 
     # Приоритет 3: Обработка ОЧЕРЕДИ команд
-    command_queue = state.get("command_queue", [])
-    if command_queue:
+    if command_queue := state.get("command_queue", []):
         command_type = command_queue[0].command
         logger.info(f"Приоритет 3: Обработка команды '{command_type}' из очереди.")
         action_map = {
@@ -610,14 +711,14 @@ async def router_node(state: AgentState) -> AgentState:
         return state
 
     # Приоритет 4: Проверка на ФАТАЛЬНУЮ ошибку PlanBuilder
-    builder_result = state.get("plan_builder_result")
-    if builder_result and builder_result.failure_reason:
-        logger.error(
-            f"Приоритет 4: PlanBuilder не смог построить план. Причина: {builder_result.failure_reason}. -> PRESENT_RESULTS"
-        )
-        state["error"] = builder_result.failure_reason  # Передаем ошибку для показа
-        state["next_action"] = PossibleActions.PRESENT_RESULTS
-        return state
+    if builder_result := state.get("plan_builder_result"):
+        if builder_result.failure_reason:
+            logger.error(
+                f"Приоритет 4: PlanBuilder не смог построить план. Причина: {builder_result.failure_reason}. -> PRESENT_RESULTS"
+            )
+            state["error"] = builder_result.failure_reason
+            state["next_action"] = PossibleActions.PRESENT_RESULTS
+            return state
 
     # Приоритет 5: Стандартный путь построения/показа плана
     if not state.get("search_criteria"):
@@ -633,181 +734,76 @@ async def router_node(state: AgentState) -> AgentState:
     return state
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 async def presenter_node(state: AgentState) -> AgentState:
-    """
-    Финальный узел. Формирует ответ для пользователя с учетом контекста и предупреждений.
-    """
-    logger.info("--- УЗЕЛ: presenter_node (v2.1) ---")
-
+    logger.info("--- УЗЕЛ: presenter_node (v2.3) ---")
     state["plan_presented"] = False
-
+    state["is_awaiting_start_address"] = False
     error = state.get("error")
-    criteria = state.get("search_criteria")
-    builder_result = state.get("plan_builder_result")
-    current_plan = state.get("current_plan")
-    user_message = state.get("user_message")
+    plan_to_show = state.get("current_plan")
+    user_start_address = state.get("user_start_address")
     response_text = ""
-
-    plan_to_show = None
-    if builder_result and builder_result.best_plan:
-        plan_to_show = builder_result.best_plan
-        logger.debug("Presenter: Использую 'best_plan' из 'plan_builder_result'.")
-    elif current_plan:
-        plan_to_show = current_plan
-        logger.debug("Presenter: Использую сохраненный 'current_plan'.")
-
-    # --- НОВАЯ ЛОГИКА: Сбор всех предупреждений ---
-    all_warnings = state.get("plan_warnings", [])
-    if plan_to_show and plan_to_show.warnings:
-        all_warnings.extend(plan_to_show.warnings)
-    # --- КОНЕЦ НОВОЙ ЛОГИКИ ---
-
-    if criteria and not criteria.city:
-        response_text = (
-            "Отличный план! Осталось только уточнить, в каком городе будем искать?"
-        )
-        state["is_awaiting_clarification"] = "city"
-    elif error:
-        # Теперь сюда попадают только настоящие ошибки
+    llm = get_gigachat_client()
+    if error:
         response_text = f"К сожалению, произошла ошибка: {error}"
-    elif builder_result and builder_result.failure_reason:
-        response_text = f"К сожалению, не удалось составить план. Причина: {builder_result.failure_reason}"
     elif not plan_to_show:
-        response_text = "Что-то пошло не так, и я не смог составить для вас план. Давайте попробуем еще раз с другими параметрами."
-    else:
-        # --- ШАГ 2: СОЗДАНИЕ УМНОГО ПРОМПТА С КОНТЕКСТОМ И ПРЕДУПРЕЖДЕНИЯМИ ---
-        llm = get_gigachat_client()
-        token_callback = TokenUsageCallbackHandler(node_name="presenter_node")
+        response_text = "Я не смог составить для вас план. Давайте попробуем еще раз."
+    elif not user_start_address:
+        state["is_awaiting_start_address"] = True
         plan_json = plan_to_show.model_dump_json(indent=2)
-
-        warnings_text = ""
-        if all_warnings:
-            # Убираем дубликаты, если они есть
-            unique_warnings = list(dict.fromkeys(all_warnings))
-            warnings_text = "\n\n### Важные уточнения:\n" + "\n".join(
-                f"- {w}" for w in unique_warnings
-            )
-
-        prompt = f"""
-Ты — "Голос" умного ассистента-планировщика. Твоя задача — сформировать финальный, дружелюбный и полезный ответ.
-
-### Контекст:
-- **Последний запрос пользователя:** "{user_message}"
-- **Системные данные (ГОТОВЫЙ ПЛАН):**
+        prompt = f"""Ты — "Голос" ассистента. Представь предварительный план и запроси адрес.
+### План:
 {plan_json}
-{warnings_text}
-
-### Твоя задача:
-1.  **Проанализируй запрос пользователя и выбери подходящую вводную фразу:**
-    - Если запрос первичный ("составь план"), начни с "Отлично, вот что я смог для вас подобрать:".
-    - Если просят напомнить ("напомни план"), начни с "Конечно, вот ваш план:".
-    - Если это подтверждение ("да, подходит"), начни с "Рад, что вам понравилось! Вот финальный план:" и в конце добавь "Приятного отдыха!".
-
-2.  **Красиво и структурированно выведи каждый пункт плана** из `items`, используя Markdown и эмодзи (📍, 🕒, 💰).
-
-3.  **Если в системных данных есть "Важные уточнения", обязательно добавь их в свой ответ** после списка мероприятий. Начни этот блок с эмодзи ⚠️ и фразы "Обратите внимание:".
-
-4.  **В конце, если это не финальное подтверждение, задай уточняющий вопрос**, например: "Как вам такой план? Устроит или что-то поменяем?"
-
-Твой ответ должен быть ТОЛЬКО текстом для пользователя.
-"""
+### Задача:
+1. Начни с: "Вот что я смог для вас подобрать в качестве предварительного плана:".
+2. Структурированно выведи каждый пункт из `items`. Используй Markdown и эмодзи.
+3. **ПЕРЕД** каждым мероприятием, кроме первого, если есть `travel_info_to_here`, добавь строку "⬇️ Переезд ~XX мин." (вычислив минуты).
+4. **В КОНЦЕ** дословно спроси: "📍 Откуда вы планируете начать ваш маршрут? Укажите адрес или напишите 'пропустить'." """
         try:
-            llm_response = await llm.ainvoke(
-                prompt, config={"callbacks": [token_callback]}
+            response_text = (await llm.ainvoke(prompt)).content
+        except Exception:
+            response_text = (
+                "Я составил план, но не могу его описать. Откуда начнем маршрут?"
             )
-            response_text = llm_response.content
-            state["plan_presented"] = True
-            logger.info("Флаг 'plan_presented' установлен в True.")
-        except Exception as e:
-            logger.error(
-                f"Ошибка при генерации ответа в presenter_node: {e}", exc_info=True
-            )
-            response_text = "Я составил для вас план, но у меня возникли трудности с его красивым описанием."
-
-    # --- ШАГ 3: ОБНОВЛЕНИЕ ИСТОРИИ И ОЧИСТКА СОСТОЯНИЯ ---
-    if response_text:
-        ai_message = AIMessage(content=response_text)
-        history = state.get("chat_history", [])
-        if not history or not (
-            isinstance(history[-1], AIMessage) and history[-1].content == response_text
-        ):
-            state["chat_history"].append(ai_message)
-        logger.info(f"Сформирован финальный ответ: '{response_text[:150]}...'")
     else:
-        logger.error(
-            "Критическая ошибка в presenter_node: не удалось сформировать текст ответа."
-        )
-        state["chat_history"].append(
-            AIMessage(content="Извините, произошла внутренняя ошибка.")
-        )
-
-    # Очищаем "одноразовые" и временные поля
+        route_text_parts = []
+        total_travel_seconds = 0
+        for item in plan_to_show.items:
+            if travel_info := item.get("travel_info_to_here"):
+                try:
+                    segment = RouteSegment.model_validate(travel_info)
+                    minutes = round(segment.duration_seconds / 60)
+                    km = round(segment.distance_meters / 1000, 1)
+                    route_text_parts.append(
+                        f"От «{segment.from_name}» до «{segment.to_name}»: ~{minutes} мин, ~{km} км"
+                    )
+                    total_travel_seconds += segment.duration_seconds
+                except Exception:
+                    continue
+        total_travel_minutes = round(total_travel_seconds / 60)
+        plan_json = plan_to_show.model_dump_json(indent=2)
+        prompt = f"""Ты — "Голос" ассистента. Представь итоговый план с маршрутом.
+### План:
+{plan_json}
+### Маршрут:
+{chr(10).join(route_text_parts)}
+### Общее время в пути: {total_travel_minutes} минут.
+### Задача:
+1. Начни с: "Вот ваш итоговый план:".
+2. Красиво выведи пункты из `items`.
+3. Добавь заголовок "➡️ Маршрут:" и выведи под ним собранный маршрут.
+4. Добавь строку "🚗 Общее время в пути: ~{total_travel_minutes} мин".
+5. Заверши фразой: "План окончательный. Если захотите что-то изменить или начать новый поиск — просто напишите! 😊" """
+        try:
+            response_text = (await llm.ainvoke(prompt)).content
+            state["plan_presented"] = True
+        except Exception:
+            response_text = "Я составил итоговый план, но не могу его описать."
+    if response_text:
+        state["chat_history"].append(AIMessage(content=response_text))
     state["plan_builder_result"] = None
     state["last_structured_command"] = None
-    state["plan_warnings"] = []  # Очищаем предупреждения после их показа
-
+    state["plan_warnings"] = []
     return state
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 # в файле nodes.py

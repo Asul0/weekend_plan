@@ -1,7 +1,7 @@
-# --- ЗАМЕНА ВСЕГО ФАЙЛА graph.py ---
+# --- НАЧАЛО БЛОКА ДЛЯ ЗАМЕНЫ: graph.py ---
 import logging
 from langgraph.graph import StateGraph, END
-from src.agent_core.state import AgentState, UserIntent
+from src.agent_core.state import AgentState
 from src.agent_core.nodes import (
     router_node,
     extract_initial_criteria_node,
@@ -15,14 +15,38 @@ from src.agent_core.nodes import (
     refine_plan_node,
     delete_activity_node,
     add_activity_node,
+    process_start_address_node,
 )
-from src.schemas.data_schemas import PossibleActions
+
+# --- ИСПРАВЛЕНИЕ ИМПОРТОВ ---
+# Мы импортируем оба Enum из одного места для консистентности
+from src.schemas.data_schemas import PossibleActions, UserIntent
 
 logger = logging.getLogger(__name__)
 
 
+# --- НОВАЯ ФУНКЦИЯ-РАЗВИЛКА ---
+def should_classify_or_process_address(state: AgentState) -> str:
+    """
+    Первая и главная развилка графа.
+    Проверяет, ждет ли система ввода адреса. Если да, то пропускает
+    классификацию и сразу отправляет на обработку адреса.
+    """
+    if state.get("is_awaiting_start_address"):
+        logger.info(
+            "Граф: Обнаружен флаг is_awaiting_start_address. Пропускаю классификацию, перехожу к обработке адреса."
+        )
+        return "PROCESS_START_ADDRESS"
+    else:
+        logger.info(
+            "Граф: Флаг ожидания адреса не установлен. Перехожу к стандартной классификации намерения."
+        )
+        return "classify_intent"
+
+
 def decide_after_classification(state: AgentState) -> str:
-    """Ключевая развилка после определения намерения."""
+    """Ключевая развилка ПОСЛЕ определения намерения."""
+    # Эта функция остается без изменений
     logger.info(
         f"Граф: Принятие решения после классификации. Намерение: {state.get('classified_intent').intent}"
     )
@@ -32,10 +56,10 @@ def decide_after_classification(state: AgentState) -> str:
 
 
 def build_agent_graph():
-    """Собирает граф агента. v7.0 с финальной архитектурой потока управления."""
+    """Собирает граф агента. v7.2 с корректной обработкой ввода адреса."""
     workflow = StateGraph(AgentState)
 
-    # 1. Добавляем узлы
+    # 1. Добавляем узлы (без изменений)
     nodes = {
         "classify_intent": classify_intent_node,
         "router": router_node,
@@ -49,52 +73,44 @@ def build_agent_graph():
         "REFINE_PLAN": refine_plan_node,
         "DELETE_ACTIVITY": delete_activity_node,
         "ADD_ACTIVITY": add_activity_node,
+        "PROCESS_START_ADDRESS": process_start_address_node,
     }
     for name, node in nodes.items():
         workflow.add_node(name, node)
 
-    # 2. Определяем точку входа
-    workflow.set_entry_point("classify_intent")
+    # --- ИЗМЕНЕНИЕ: Устанавливаем новую условную точку входа ---
+    # workflow.set_entry_point("classify_intent") <-- СТАРАЯ ВЕРСИЯ
+    workflow.set_conditional_entry_point(
+        should_classify_or_process_address,
+        {
+            "PROCESS_START_ADDRESS": "PROCESS_START_ADDRESS",
+            "classify_intent": "classify_intent",
+        },
+    )
+    # --- КОНЕЦ ИЗМЕНЕНИЯ ---
 
-    # 3. Определяем ребра
+    # 3. Определяем остальные ребра
     workflow.add_conditional_edges(
         "classify_intent",
         decide_after_classification,
         {"CLARIFY_OR_CHITCHAT": "CLARIFY_OR_CHITCHAT", "router": "router"},
     )
-
-    # После анализа фидбека всегда идем в роутер, который начнет исполнять очередь
     workflow.add_edge("ANALYZE_FEEDBACK", "router")
-
-    # --- ЯВНЫЙ ПОТОК ПЕРЕПЛАНИРОВАНИЯ ---
-    # После любого изменения состояния мы ОБЯЗАТЕЛЬНО идем строить новый план.
     workflow.add_edge("REFINE_PLAN", "BUILD_PLAN")
     workflow.add_edge("DELETE_ACTIVITY", "BUILD_PLAN")
     workflow.add_edge("ADD_ACTIVITY", "BUILD_PLAN")
-
-    # После построения плана всегда идем в роутер. Он проверит, пуста ли
-    # очередь команд, и либо исполнит следующую, либо пойдет на PRESENT_RESULTS.
     workflow.add_edge("BUILD_PLAN", "router")
-
-    # Узлы подготовки данных возвращаются в роутер
     workflow.add_edge("EXTRACT_CRITERIA", "router")
     workflow.add_edge("SEARCH_EVENTS", "router")
+    workflow.add_edge(
+        "PROCESS_START_ADDRESS", "PRESENT_RESULTS"
+    )  # Связь от обработки адреса к показу результата
 
     # Главная развилка - роутер
+    # Используем более надежный способ создания словаря для conditional_edges
+    action_map = {action.value: action.value for action in PossibleActions}
     workflow.add_conditional_edges(
-        "router",
-        lambda state: state["next_action"].value,
-        {
-            "HANDLE_CLARIFICATION": "HANDLE_CLARIFICATION",
-            "EXTRACT_CRITERIA": "EXTRACT_CRITERIA",
-            "SEARCH_EVENTS": "SEARCH_EVENTS",
-            "ANALYZE_FEEDBACK": "ANALYZE_FEEDBACK",
-            "BUILD_PLAN": "BUILD_PLAN",
-            "REFINE_PLAN": "REFINE_PLAN",
-            "DELETE_ACTIVITY": "DELETE_ACTIVITY",
-            "ADD_ACTIVITY": "ADD_ACTIVITY",
-            "PRESENT_RESULTS": "PRESENT_RESULTS",
-        },
+        "router", lambda state: state["next_action"].value, action_map
     )
 
     # Конечные узлы графа
@@ -102,9 +118,9 @@ def build_agent_graph():
     workflow.add_edge("CLARIFY_OR_CHITCHAT", END)
 
     app = workflow.compile()
-    logger.info("Агентский граф (v7.0, Финальная версия) скомпилирован.")
+    logger.info("Агентский граф (v7.2, с условной точкой входа) скомпилирован.")
     return app
 
 
 agent_app = build_agent_graph()
-# --- КОНЕЦ ЗАМЕНЫ ---
+# --- КОНЕЦ БЛОКА ДЛЯ ЗАМЕНЫ ---
