@@ -198,26 +198,40 @@ class CommandProcessor:
             )
 
         elif intent.attribute == "price":
-            # Для операторов MIN/MAX значение не нужно
             if intent.operator in ["MIN", "MAX"]:
-                return 0  # Возвращаем условное значение, оно не будет использоваться
+                return 0
 
-            # Для "дешевле чем X" или "дороже чем X"
             if intent.value_num is not None:
                 return intent.value_num
 
-            # Для "дешевле/дороже" без конкретики, относительно текущего
             current_item = self._get_item_from_plan(intent.target)
-            if (
-                not current_item
-                or not hasattr(current_item, "min_price")
-                or current_item.min_price is None
-            ):
-                raise ValueError(
-                    f"Не найден элемент '{intent.target}' или его цена для относительного изменения."
-                )
 
-            return current_item.min_price
+            # --- НАЧАЛО ИСПРАВЛЕНИЯ ---
+            if isinstance(current_item, FoodPlaceInfo):
+                if current_item.avg_bill_str:
+                    # Извлекаем первое число из строки типа "1000–1500 ₽"
+                    match = re.search(
+                        r"\d+", current_item.avg_bill_str.replace(" ", "")
+                    )
+                    if match:
+                        return float(match.group(0))
+
+            if isinstance(current_item, Event) and current_item.min_price is not None:
+                return current_item.min_price
+            # --- КОНЕЦ ИСПРАВЛЕНИЯ ---
+
+            raise ValueError(
+                f"Не найден элемент '{intent.target}' или его цена для относительного изменения."
+            )
+
+        # --- НАЧАЛО ВТОРОГО ИСПРАВЛЕНИЯ (для смены фильма) ---
+        elif intent.attribute == "name":
+            current_item = self._get_item_from_plan(intent.target)
+            if not current_item or not hasattr(current_item, "name"):
+                raise ValueError(
+                    f"Не найден элемент '{intent.target}' или его имя в плане."
+                )
+            return current_item.name
 
         # Для других атрибутов (имя, рейтинг) просто возвращаем извлеченное значение
         return intent.value_str or intent.value_num
@@ -235,32 +249,49 @@ class CommandProcessor:
     def _get_item_from_plan(self, target_type: str) -> Optional[PlanItem]:
         """
         Надежно находит и парсит элемент в текущем плане по его типу.
-        УЛУЧШЕННАЯ И УПРОЩЕННАЯ ВЕРСИЯ.
+        Версия 2.0: Устойчива к неполным данным в плане.
         """
         if not self.state.get("current_plan"):
             return None
 
         for item_dict in self.state["current_plan"].items:
-            try:
-                parsed_item = None
-                # Проверяем наличие уникальных ключей для определения модели
-                if "session_id" in item_dict:  # Это точно Event
-                    parsed_item = Event.model_validate(item_dict)
-                elif (
-                    "id_gis" in item_dict and "avg_bill_str" in item_dict
-                ):  # Это точно FoodPlace
-                    parsed_item = FoodPlaceInfo.model_validate(item_dict)
-                elif "id_gis" in item_dict:  # Это Park
-                    parsed_item = ParkInfo.model_validate(item_dict)
-                else:
-                    continue  # Неизвестный тип элемента
+            # --- НАЧАЛО ИСПРАВЛЕНИЯ ---
+            # Определяем тип элемента по наличию уникальных ключей,
+            # это быстрее и надежнее, чем обработка исключений Pydantic.
 
-                if self._get_activity_type_from_item(parsed_item) == target_type:
-                    return parsed_item
-            except Exception as e:
-                logger.warning(f"Не удалось распарсить элемент плана при поиске: {e}")
-                continue
-        return None
+            item_type = None
+            if "session_id" in item_dict and "user_event_type_key" in item_dict:
+                item_type = item_dict["user_event_type_key"]
+            elif "avg_bill_str" in item_dict:
+                item_type = "RESTAURANT"
+            elif "id_gis" in item_dict:  # Парк - самый общий случай с id_gis
+                item_type = "PARK"
+
+            # Если определенный тип совпадает с тем, что мы ищем...
+            if item_type == target_type:
+                try:
+                    # ...только тогда мы пытаемся его распарсить в полную модель.
+                    if item_type in [
+                        "MOVIE",
+                        "CONCERT",
+                        "STAND_UP",
+                        "PERFORMANCE",
+                        "MUSEUM_EXHIBITION",
+                    ]:
+                        return Event.model_validate(item_dict)
+                    elif item_type == "RESTAURANT":
+                        return FoodPlaceInfo.model_validate(item_dict)
+                    elif item_type == "PARK":
+                        return ParkInfo.model_validate(item_dict)
+                except Exception as e:
+                    # Если даже тут произошла ошибка, логируем ее и продолжаем поиск.
+                    logger.warning(
+                        f"Не удалось распарсить элемент плана '{item_dict.get('name')}' при поиске: {e}"
+                    )
+                    continue
+            # --- КОНЕЦ ИСПРАВЛЕНИЯ ---
+
+        return None  # Если ничего не найдено в цикле
 
     @staticmethod
     def _get_activity_type_from_item(item: PlanItem) -> str:

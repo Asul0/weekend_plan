@@ -364,44 +364,66 @@ class PlanBuilder:
     def _update_pinned_items(self, plan: Plan):
         """
         Сохраняет элементы успешного плана в state для будущих модификаций.
-        Версия 2.1 с корректным определением типа RESTAURANT.
+        Версия 2.2: Надежное определение типа элемента из словаря по уникальным ключам.
         """
         new_pinned_items = {}
-        # Используем Pydantic для безопасного парсинга словарей из плана
-        all_item_types = (Event, ParkInfo, FoodPlaceInfo)
+        all_item_models = {
+            "EVENT": Event,  # Используем общий ключ для всех событий
+            "PARK": ParkInfo,
+            "RESTAURANT": FoodPlaceInfo,
+        }
 
         for item_dict in plan.items:
-            # Сначала убираем наше служебное поле, чтобы не мешать валидации
-            item_data_for_validation = item_dict.copy()
-            if "travel_info_to_here" in item_data_for_validation:
-                del item_data_for_validation["travel_info_to_here"]
+            activity_type_key = None
 
-            parsed_item = None
-            for item_class in all_item_types:
+            # --- НАЧАЛО НОВОЙ, НАДЕЖНОЙ ЛОГИКИ ОПРЕДЕЛЕНИЯ ТИПА ---
+            if "session_id" in item_dict and "user_event_type_key" in item_dict:
+                # Это точно событие из Афиши (кино, концерт и т.д.)
+                activity_type_key = item_dict["user_event_type_key"]
+            elif "avg_bill_str" in item_dict:
+                # Наличие среднего чека - уникальный признак кафе
+                activity_type_key = "RESTAURANT"
+            elif "id_gis" in item_dict:
+                # Если это не кафе, но есть id_gis - скорее всего, это парк
+                activity_type_key = "PARK"
+            # --- КОНЕЦ НОВОЙ ЛОГИКИ ---
+
+            if activity_type_key:
                 try:
-                    # Валидируем очищенные данные
-                    parsed_item = item_class.model_validate(item_data_for_validation)
-                    break
-                except Exception:
-                    continue
+                    # Определяем, какую модель использовать для валидации
+                    # Для всех событий Афиши (MOVIE, CONCERT) используем модель Event
+                    model_to_use = None
+                    if activity_type_key in [
+                        "MOVIE",
+                        "CONCERT",
+                        "STAND_UP",
+                        "PERFORMANCE",
+                        "MUSEUM_EXHIBITION",
+                    ]:
+                        model_to_use = all_item_models["EVENT"]
+                    elif activity_type_key in all_item_models:
+                        model_to_use = all_item_models[activity_type_key]
 
-            if parsed_item:
-                activity_type_key = ""
-                # --- КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ ЗДЕСЬ ---
-                # Определяем тип активности для ключа словаря pinned_items
-                if isinstance(parsed_item, Event):
-                    # Для событий из Афиши ключ уже задан при поиске
-                    activity_type_key = parsed_item.user_event_type_key
-                elif isinstance(parsed_item, ParkInfo):
-                    # Для парков ключ всегда "PARK"
-                    activity_type_key = "PARK"
-                elif isinstance(parsed_item, FoodPlaceInfo):
-                    # Для еды ключ всегда "RESTAURANT"
-                    activity_type_key = "RESTAURANT"
-                # --- КОНЕЦ ИСПРАВЛЕНИЯ ---
+                    if model_to_use:
+                        # Убираем служебное поле перед валидацией
+                        item_data_for_validation = item_dict.copy()
+                        if "travel_info_to_here" in item_data_for_validation:
+                            del item_data_for_validation["travel_info_to_here"]
 
-                if activity_type_key:
-                    new_pinned_items[activity_type_key] = parsed_item
+                        parsed_item = model_to_use.model_validate(
+                            item_data_for_validation
+                        )
+                        new_pinned_items[activity_type_key] = parsed_item
+                    else:
+                        logger.warning(
+                            f"Не найдена модель для валидации типа '{activity_type_key}'"
+                        )
+
+                except Exception as e:
+                    logger.error(
+                        f"Ошибка валидации при закреплении элемента '{item_dict.get('name')}': {e}",
+                        exc_info=True,
+                    )
 
         self.state["pinned_items"] = new_pinned_items
         logger.info(

@@ -1170,22 +1170,45 @@ def _apply_constraint(
 ) -> List[PlanItem]:
     """
     Применяет одно семантическое ограничение к списку кандидатов.
-    ФИНАЛЬНАЯ ВЕРСИЯ: Работает с семантическими именами атрибутов.
+    Версия 2.1: Универсальная, работает с разными типами объектов (Event, FoodPlaceInfo).
     """
     new_filtered_list = []
 
-    # --- КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: Сопоставляем семантику с моделью ЗДЕСЬ ---
+    # --- НАЧАЛО ИСПРАВЛЕНИЯ ---
+    import re
+    from src.schemas.data_schemas import (
+        Event,
+        FoodPlaceInfo,
+        ParkInfo,
+    )  # Добавляем импорты
+    from datetime import datetime, timedelta  # Добавляем импорты
+
+    # Вспомогательная функция для безопасного извлечения числового значения цены
+    def get_price_from_candidate(candidate: PlanItem) -> Optional[float]:
+        if isinstance(candidate, Event) and candidate.min_price is not None:
+            return float(candidate.min_price)
+        if isinstance(candidate, FoodPlaceInfo) and candidate.avg_bill_str:
+            # Извлекаем первое число из строки типа "1000–1500 ₽" или "1200 ₽"
+            match = re.search(r"\d+", candidate.avg_bill_str.replace(" ", ""))
+            if match:
+                return float(match.group(0))
+        return None
+
+    # Сопоставляем семантику с реальными атрибутами или функциями
     attr_map = {
         "start_time": "start_time_naive_event_tz",
-        "price": "min_price",
         "rating": "rating",
         "name": "name",
+        # Для цены теперь используем нашу новую функцию
+        "price": get_price_from_candidate,
     }
-    model_attribute = attr_map.get(constr.attribute)
-    if not model_attribute:
+
+    model_attribute_or_getter = attr_map.get(constr.attribute)
+    if not model_attribute_or_getter:
         logger.warning(f"Неизвестный атрибут для фильтрации: {constr.attribute}")
-        return candidates  # Возвращаем без изменений, если атрибут не знаком
-    # --- КОНЕЦ ИЗМЕНЕНИЯ ---
+        return candidates
+
+    # --- КОНЕЦ ИСПРАВЛЕНИЯ ---
 
     # Вспомогательная функция для безопасного приведения типов
     def get_typed_value(value_str: str, target_type: str):
@@ -1199,10 +1222,11 @@ def _apply_constraint(
     is_datetime = constr.attribute == "start_time"
 
     try:
-        if is_datetime:
-            target_value = get_typed_value(constr.value, "datetime")
-        elif is_numeric:
+        # Для цены значение всегда числовое
+        if constr.attribute == "price":
             target_value = get_typed_value(constr.value, "float")
+        elif is_datetime:
+            target_value = get_typed_value(constr.value, "datetime")
         else:
             target_value = constr.value
     except (ValueError, TypeError):
@@ -1212,9 +1236,14 @@ def _apply_constraint(
         return []
 
     for candidate in candidates:
-        cand_value = getattr(
-            candidate, model_attribute, None
-        )  # <-- Используем model_attribute
+        # --- НАЧАЛО ИСПРАВЛЕНИЯ ---
+        # Если наш атрибут - это функция (как для цены), вызываем ее. Иначе - getattr.
+        if callable(model_attribute_or_getter):
+            cand_value = model_attribute_or_getter(candidate)
+        else:
+            cand_value = getattr(candidate, model_attribute_or_getter, None)
+        # --- КОНЕЦ ИСПРАВЛЕНИЯ ---
+
         if cand_value is None:
             continue
 
@@ -1236,7 +1265,7 @@ def _apply_constraint(
                     is_match = cand_value > target_value
                 if constr.operator == "LESS_THAN":
                     is_match = cand_value < target_value
-            else:
+            else:  # Для строковых атрибутов, как 'name'
                 if constr.operator == "NOT_EQUALS":
                     is_match = cand_value != target_value
                 if constr.operator == "EQUALS":
