@@ -141,7 +141,8 @@ class CommandProcessor:
 
         try:
             final_value = self._calculate_final_value(intent)
-            if final_value is None:
+            # Для операторов MIN/MAX None - это нормальное значение
+            if final_value is None and intent.operator not in ["MIN", "MAX"]:
                 raise ValueError("Не удалось вычислить финальное значение.")
         except Exception as e:
             logger.error(
@@ -151,11 +152,12 @@ class CommandProcessor:
             return None
 
         # Преобразуем значение в строку для Pydantic модели, но делаем это умно
-        value_for_model = (
-            final_value.isoformat()
-            if isinstance(final_value, datetime)
-            else str(final_value)
-        )
+        if final_value is None:
+            value_for_model = None
+        elif isinstance(final_value, datetime):
+            value_for_model = final_value.isoformat()
+        else:
+            value_for_model = str(final_value)
 
         constraint = Constraint(
             attribute=intent.attribute,
@@ -232,6 +234,10 @@ class CommandProcessor:
                     f"Не найден элемент '{intent.target}' или его имя в плане."
                 )
             return current_item.name
+
+        # Для операторов MIN/MAX не нужно конкретное значение
+        if intent.operator in ["MIN", "MAX"]:
+            return None
 
         # Для других атрибутов (имя, рейтинг) просто возвращаем извлеченное значение
         return intent.value_str or intent.value_num

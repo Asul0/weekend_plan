@@ -40,6 +40,81 @@ logger = logging.getLogger(__name__)
 logger = logging.getLogger(__name__)
 
 
+async def _recalculate_all_route_segments(plan, state) -> None:
+    """
+    Пересчитывает все маршруты между элементами плана.
+    Обновляет travel_info_to_here для каждого элемента (кроме первого).
+    """
+    if not plan or not plan.items or len(plan.items) < 2:
+        logger.info("План содержит менее 2 элементов, пересчет маршрутов не требуется.")
+        return
+
+    logger.info(f"Пересчитываю маршруты для {len(plan.items)} элементов плана...")
+
+    # Проходим по всем элементам плана, начиная со второго
+    for i in range(1, len(plan.items)):
+        current_item = plan.items[i]
+        previous_item = plan.items[i - 1]
+
+        # Получаем координаты предыдущего элемента
+        prev_coords = None
+        if previous_item.get("coords"):
+            prev_coords = {
+                "lon": previous_item["coords"][0],
+                "lat": previous_item["coords"][1],
+            }
+        elif previous_item.get("place_coords_lon"):
+            prev_coords = {
+                "lon": previous_item["place_coords_lon"],
+                "lat": previous_item["place_coords_lat"],
+            }
+
+        # Получаем координаты текущего элемента
+        current_coords = None
+        if current_item.get("coords"):
+            current_coords = {
+                "lon": current_item["coords"][0],
+                "lat": current_item["coords"][1],
+            }
+        elif current_item.get("place_coords_lon"):
+            current_coords = {
+                "lon": current_item["place_coords_lon"],
+                "lat": current_item["place_coords_lat"],
+            }
+
+        if not prev_coords or not current_coords:
+            logger.warning(f"Не удалось получить координаты для элемента {i+1} или {i}")
+            continue
+
+        # Строим маршрут между элементами
+        logger.info(
+            f"Строю маршрут от '{previous_item.get('name', 'N/A')}' до '{current_item.get('name', 'N/A')}'"
+        )
+        route_info = await get_route(points=[prev_coords, current_coords])
+
+        if route_info.get("status") == "success":
+            route_segment = RouteSegment(
+                from_name=previous_item.get("name", "Предыдущий пункт"),
+                to_name=current_item.get("name", "Текущий пункт"),
+                duration_seconds=route_info.get("duration_seconds", 0),
+                distance_meters=route_info.get("distance_meters", 0),
+                from_coords=prev_coords,
+                to_coords=current_coords,
+            )
+
+            # Обновляем информацию о маршруте в текущем элементе
+            current_item["travel_info_to_here"] = route_segment.model_dump()
+            logger.info(
+                f"Маршрут успешно построен: ~{round(route_segment.duration_seconds / 60)} мин, ~{round(route_segment.distance_meters / 1000, 1)} км"
+            )
+        else:
+            logger.warning(
+                f"Не удалось построить маршрут между элементами {i} и {i+1}: {route_info.get('message', 'Неизвестная ошибка')}"
+            )
+
+    logger.info("Пересчет маршрутов между элементами плана завершен.")
+
+
 class DecomposedIntent(BaseModel):
     """Промежуточная структура. Одно сырое, неразобранное намерение."""
 
@@ -637,6 +712,11 @@ async def process_start_address_node(state: AgentState) -> AgentState:
         logger.info(
             "Маршрут от дома успешно добавлен/обновлен в первом элементе плана."
         )
+
+        # --- НОВЫЙ КОД: Пересчет всех маршрутов между элементами плана ---
+        logger.info("Пересчитываю маршруты между всеми элементами плана...")
+        await _recalculate_all_route_segments(current_plan, state)
+
     else:
         logger.warning(
             f"Не удалось построить маршрут от дома до первого мероприятия. Ошибка: {route_info.get('message')}"

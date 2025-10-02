@@ -22,40 +22,23 @@ class PossibleActions(str, Enum):
 
 class RouteSegment(BaseModel):
     """Представляет один отрезок маршрута от одной точки до другой."""
+
     model_config = ConfigDict(extra="ignore")
 
     from_name: str = Field(description="Название начальной точки.")
     to_name: str = Field(description="Название конечной точки.")
     duration_seconds: int = Field(description="Длительность поездки в секундах.")
     distance_meters: float = Field(description="Расстояние в метрах.")
-    from_coords: Optional[Dict[str, float]] = Field(None, description="Координаты начальной точки.")
-    to_coords: Optional[Dict[str, float]] = Field(None, description="Координаты конечной точки.")
+    from_coords: Optional[Dict[str, float]] = Field(
+        None, description="Координаты начальной точки."
+    )
+    to_coords: Optional[Dict[str, float]] = Field(
+        None, description="Координаты конечной точки."
+    )
 
 
 # Файл: src/schemas/data_schemas.py
 # ДОБАВЬТЕ ЭТИ ДВА КЛАССА В КОНЕЦ ФАЙЛА
-
-
-class SimplifiedExtractedInfo(BaseModel):
-    """
-    Упрощенная схема для LLM. Извлекает активности как простой список строк,
-    чтобы повысить надежность распознавания.
-    """
-
-    city: Optional[str] = Field(None, description="Название города.")
-    dates_description: Optional[str] = Field(
-        None, description="Описание дат или периода, как его дал пользователь."
-    )
-    # КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: Просим извлечь просто список строк
-    activities_list: Optional[List[str]] = Field(
-        None,
-        description="Список всех упомянутых активностей, например: ['фильм', 'покушать', 'погулять в парке'].",
-    )
-    budget: Optional[int] = Field(None, description="Общий бюджет пользователя.")
-    person_count: Optional[int] = Field(1, description="Количество человек.")
-    raw_time_description: Optional[str] = Field(
-        None, description="Необработанное описание времени (e.g., 'после обеда')."
-    )
 
 
 class ActivityClassifier(BaseModel):

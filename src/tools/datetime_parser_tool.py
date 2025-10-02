@@ -184,6 +184,7 @@ def python_date_parser(
             "на выходных",
             "текущие выходные",
             "ближайшие выходные",
+            "на этих выходных",
         ]
     ):
         saturday, sunday = _calculate_weekend_dates_simple(
@@ -195,6 +196,7 @@ def python_date_parser(
             parsed_info["is_range"],
         ) = (saturday, sunday, True)
         return parsed_info
+    
     if any(kw in nl_date_lower for kw in ["следующие выходные"]):
         saturday, sunday = _calculate_weekend_dates_simple(
             base_datetime, next_weekend=True
