@@ -25,6 +25,7 @@ from src.schemas.data_schemas import (
     ClassifiedIntent,
     RouteSegment,
 )
+
 from src.tools.datetime_parser_tool import datetime_parser_tool
 from src.tools.gis_tools import park_search_tool, food_place_search_tool
 from src.services.gis_service import get_geocoding_details, get_route
@@ -38,6 +39,290 @@ from src.utils.callbacks import TokenUsageCallbackHandler
 logger = logging.getLogger(__name__)
 
 logger = logging.getLogger(__name__)
+
+
+class ClarifiedInfo(BaseModel):
+    """
+    Схема для LLM, чтобы извлечь уточненные данные из ответа пользователя.
+    """
+    city: Optional[str] = Field(None, description="Название города, если пользователь его уточнил.")
+    dates_description: Optional[str] = Field(None, description="Описание дат или периода, если пользователь его уточнил.")
+    activities_str: Optional[str] = Field(None, description="Перечисление активностей, если пользователь их уточнил (через запятую).")
+    is_irrelevant: bool = Field(False, description="True, если ответ пользователя явно не относится к запросу уточнения.")
+    irrelevant_response_summary: Optional[str] = Field(None, description="Краткое описание нерелевантного ответа пользователя, если is_irrelevant=True.")
+
+
+
+async def check_and_ask_for_missing_criteria_node(state: AgentState) -> AgentState:
+    """
+    Проверяет наличие обязательных критериев (город, дата, активность).
+    Если чего-то не хватает, формирует вопрос пользователю и устанавливает флаги ожидания.
+    Версия 2.0: Корректно устанавливает next_action для остановки графа.
+    """
+    logger.info("--- УЗЕЛ: check_and_ask_for_missing_criteria_node (v2.0) ---")
+
+    search_criteria: Optional[ExtractedInitialInfo] = state.get("search_criteria")
+    chat_history = state.get("chat_history", [])
+
+    # Инициализируем новые поля, если их нет
+    if "is_awaiting_criteria_clarification" not in state:
+        state["is_awaiting_criteria_clarification"] = False
+    if "missing_criteria_fields" not in state:
+        state["missing_criteria_fields"] = []
+    if "last_clarification_question" not in state:
+        state["last_clarification_question"] = None
+
+    if not search_criteria:
+        missing = ["city", "dates_description", "activity_type"]
+        state["missing_criteria_fields"] = missing
+        state["is_awaiting_criteria_clarification"] = True
+        state["next_action"] = PossibleActions.ASK_FOR_CRITERIA_CLARIFICATION
+        logger.warning("search_criteria отсутствует. Запрашиваем все обязательные поля.")
+        return state
+
+    missing_fields = []
+    if not search_criteria.city:
+        missing_fields.append("city")
+    if not search_criteria.dates_description and not state.get("parsed_dates_iso"):
+        missing_fields.append("dates_description")
+    if not search_criteria.ordered_activities:
+        missing_fields.append("activity_type")
+
+    if missing_fields:
+        logger.info(f"Обнаружены отсутствующие обязательные поля: {missing_fields}")
+        state["missing_criteria_fields"] = missing_fields
+        state["is_awaiting_criteria_clarification"] = True
+        # --- КЛЮЧЕВОЕ ИЗМЕНЕНИЕ ---
+        # Устанавливаем next_action, чтобы граф остановился и задал вопрос
+        state["next_action"] = PossibleActions.ASK_FOR_CRITERIA_CLARIFICATION
+
+        llm = get_gigachat_client()
+        token_callback = TokenUsageCallbackHandler(node_name="ask_clarification_prompt")
+
+        prompt_parts = [
+            "Ты — вежливый и услужливый помощник по планированию досуга. Твоя задача — запросить у пользователя недостающую информацию для поиска мероприятий.",
+            "На основе текущего диалога и того, какие поля отсутствуют, сформулируй один короткий и точный вопрос.",
+            "Если отсутствуют несколько полей, запроси их все в одном вопросе. Например: 'В каком городе и на какую дату вы хотели бы найти?'",
+            "Избегай избыточной вежливости, будь прямолинеен, но дружелюбен.",
+            "Не упоминай системные названия полей (city, dates_description, activity_type), используй естественный язык (город, дата, что именно).",
+            "Текущие критерии:",
+            f"  Город: {search_criteria.city if search_criteria.city else 'не указан'}",
+            f"  Дата: {search_criteria.dates_description if search_criteria.dates_description else 'не указана'}",
+            f"  Активность: {', '.join([act.query_details for act in search_criteria.ordered_activities]) if search_criteria.ordered_activities else 'не указана'}",
+            "\nНедостающие данные: " + ", ".join([
+                "город" if "city" in missing_fields else "",
+                "дату" if "dates_description" in missing_fields else "",
+                "что именно вы хотите найти (кино, театр, концерт и т.д.)" if "activity_type" in missing_fields else ""
+            ]).strip().replace(", ,", ",").strip(", "),
+            "\nСформулируй вопрос:"
+        ]
+        
+        relevant_history = chat_history[-2:] if len(chat_history) > 2 else chat_history
+        if relevant_history:
+            prompt_parts.insert(0, "Вот последние сообщения из нашего диалога:")
+            for msg in relevant_history:
+                prompt_parts.append(f"{'Пользователь' if isinstance(msg, HumanMessage) else 'Ассистент'}: {msg.content}")
+            prompt_parts.append("\nНа основе этого:")
+
+        clarification_question_prompt = "\n".join(prompt_parts)
+
+        try:
+            response = await llm.ainvoke(clarification_question_prompt, config={"callbacks": [token_callback]})
+            question = response.content.strip()
+            state["last_clarification_question"] = question
+            logger.info(f"Сгенерирован вопрос для уточнения: '{question}'")
+            state["chat_history"].append(AIMessage(content=question))
+        except Exception as e:
+            logger.error(f"Ошибка при генерации вопроса для уточнения: {e}", exc_info=True)
+            default_question = "Пожалуйста, уточните недостающие данные: " + \
+                               ", ".join([
+                                   "город" if "city" in missing_fields else "",
+                                   "дату" if "dates_description" in missing_fields else "",
+                                   "что именно вы хотите найти" if "activity_type" in missing_fields else ""
+                               ]).strip().replace(", ,", ",").strip(", ") + "."
+            state["last_clarification_question"] = default_question
+            state["chat_history"].append(AIMessage(content=default_question))
+
+        return state
+    else:
+        logger.info("Все обязательные критерии присутствуют. Возвращаемся в роутер для продолжения.")
+        state["is_awaiting_criteria_clarification"] = False
+        state["missing_criteria_fields"] = []
+        state["last_clarification_question"] = None
+        # --- КЛЮЧЕВОЕ ИЗМЕНЕНИЕ ---
+        # Не устанавливаем next_action здесь. Роутер сам решит, что делать дальше.
+        # state["next_action"] = PossibleActions.SEARCH_EVENTS # <-- УДАЛЕНО
+
+    return state
+
+async def process_clarification_node(state: AgentState) -> AgentState:
+    """
+    Обрабатывает ответ пользователя на запрос уточнения критериев.
+    Пытается извлечь недостающие данные и обновить состояние.
+    """
+    logger.info("--- УЗЕЛ: process_clarification_node ---")
+
+    user_message = state.get("user_message", "")
+    search_criteria: Optional[ExtractedInitialInfo] = state.get("search_criteria")
+    missing_fields: List[str] = state.get("missing_criteria_fields", [])
+    last_question: Optional[str] = state.get("last_clarification_question")
+    chat_history = state.get("chat_history", [])
+
+    if not search_criteria:
+        logger.error("process_clarification_node вызван без search_criteria. Возвращаемся к извлечению.")
+        state["next_action"] = PossibleActions.EXTRACT_CRITERIA
+        state["is_awaiting_criteria_clarification"] = False
+        state["missing_criteria_fields"] = []
+        state["last_clarification_question"] = None
+        return state
+
+    llm = get_gigachat_client()
+    token_callback = TokenUsageCallbackHandler(node_name="process_clarification_extract")
+
+    # Формируем промпт для извлечения уточненных данных
+    prompt_parts = [
+        "Ты — системный анализатор. Твоя задача — извлечь из ответа пользователя только ту информацию, которая относится к запросу уточнения.",
+        "Мы запросили у пользователя следующие данные: " + ", ".join(missing_fields) + ".",
+        f"Последний вопрос, который был задан: '{last_question}'",
+        "Проанализируй ответ пользователя и извлеки соответствующие поля. Если ответ явно не относится к запросу, установи 'is_irrelevant' в True.",
+        "Если пользователь предоставил активности, извлеки их как ОДНУ СТРОКУ, разделенную запятыми (для поля activities_str).",
+        "Возвращай ТОЛЬКО JSON-объект.",
+        "\n### Ответ пользователя:",
+        f"'{user_message}'",
+    ]
+    
+    # Добавляем последние сообщения для контекста
+    relevant_history = chat_history[-4:] if len(chat_history) > 4 else chat_history
+    if relevant_history:
+        prompt_parts.insert(0, "Вот последние сообщения из нашего диалога:")
+        for msg in relevant_history:
+            prompt_parts.append(f"{'Пользователь' if isinstance(msg, HumanMessage) else 'Ассистент'}: {msg.content}")
+        prompt_parts.append("\nНа основе этого:")
+
+    clarification_extractor_prompt = "\n".join(prompt_parts)
+
+    try:
+        extractor = llm.with_structured_output(ClarifiedInfo)
+        clarified_data: ClarifiedInfo = await extractor.ainvoke(
+            clarification_extractor_prompt, config={"callbacks": [token_callback]}
+        )
+        logger.info(f"Извлеченные уточненные данные: {clarified_data.model_dump_json(indent=2)}")
+
+        if clarified_data.is_irrelevant:
+            logger.info("Ответ пользователя признан нерелевантным.")
+            # Генерируем вежливый повторный запрос
+            re_ask_llm = get_gigachat_client()
+            re_ask_callback = TokenUsageCallbackHandler(node_name="re_ask_irrelevant")
+            re_ask_prompt = f"""
+Ты — вежливый и услужливый помощник. Пользователь ответил на твой вопрос '{last_question}' нерелевантным сообщением: '{user_message}'.
+Его ответ был: '{clarified_data.irrelevant_response_summary or user_message[:50]}'.
+Твоя задача — вежливо подтвердить, что ты услышал его, но мягко напомнить, что для продолжения тебе нужна запрошенная информация.
+Сформулируй короткий и дружелюбный ответ.
+Пример: "Я рад за вас, что у вас хороший компьютер, но для поиска спектакля мне все еще нужен город. Пожалуйста, напишите его."
+"""
+            re_ask_response = await re_ask_llm.ainvoke(re_ask_prompt, config={"callbacks": [re_ask_callback]})
+            state["chat_history"].append(AIMessage(content=re_ask_response.content.strip()))
+            # Состояние ожидания остается прежним, так как данные не получены
+            state["next_action"] = PossibleActions.ASK_FOR_CRITERIA_CLARIFICATION
+            return state
+
+        # Обновляем search_criteria на основе полученных данных
+        updated = False
+        if "city" in missing_fields and clarified_data.city:
+            search_criteria.city = clarified_data.city
+            updated = True
+            logger.info(f"Обновлен город: {search_criteria.city}")
+        
+
+
+
+        if "dates_description" in missing_fields and clarified_data.dates_description:
+            search_criteria.dates_description = clarified_data.dates_description
+            # Используем datetime_parser_tool для парсинга даты
+            parsed_result = await datetime_parser_tool.ainvoke(
+                {"natural_language_date": clarified_data.dates_description}
+            )
+            if parsed_result:
+                state["parsed_dates_iso"] = [parsed_result["datetime_iso"]] if parsed_result["datetime_iso"] else []
+                state["parsed_end_dates_iso"] = [parsed_result["end_datetime_iso"]] if parsed_result["end_datetime_iso"] else []
+                logger.info(f"Даты успешно распарсены с помощью datetime_parser_tool: начало={state['parsed_dates_iso']}, конец={state['parsed_end_dates_iso']}")
+            else:
+                state["parsed_dates_iso"] = []
+                state["parsed_end_dates_iso"] = []
+                logger.warning(f"datetime_parser_tool не смог распарсить дату: '{clarified_data.dates_description}'")
+
+            updated = True
+            logger.info(f"Обновлено описание даты: {search_criteria.dates_description}")
+
+
+
+
+
+        if "activity_type" in missing_fields and clarified_data.activities_str:
+            # Если получили строку активностей, нужно ее классифицировать
+            activities_list = [act.strip() for act in clarified_data.activities_str.split(",") if act.strip()]
+            if activities_list:
+                activity_classifier = llm.with_structured_output(ActivityClassifier)
+                new_ordered_activities = []
+                for activity_str in activities_list:
+                    classify_callback = TokenUsageCallbackHandler(node_name=f"classify_clarified_activity_{activity_str[:10]}")
+                    classify_prompt = f"""
+Твоя задача — классифицировать активность пользователя, выбрав ОДИН наиболее подходящий системный тип.
+### Системные типы и их ключевые слова:
+- **MOVIE**: Кино, фильм, сеанс, кинотеатр.
+- **PARK**: Парк, сквер, погулять на природе, сад, набережная, аллея.
+- **RESTAURANT**: Поесть, покушать, ресторан, кафе, бар, ужин, обед, перекусить, выпить кофе.
+- **CONCERT**: Концерт, музыкальное выступление, опен-эйр.
+- **STAND_UP**: Стендап, комедийное шоу, открытый микрофон.
+- **PERFORMANCE**: Спектакль, театр, балет, опера.
+- **MUSEUM_EXHIBITION**: Музей, выставка, галерея, экспозиция.
+- **UNKNOWN**: Если не подходит ни один из вышеперечисленных.
+### ЗАДАЧА: Классифицируй следующую активность: "{activity_str}"
+"""
+                    classified_activity = await activity_classifier.ainvoke(
+                        classify_prompt, config={"callbacks": [classify_callback]}
+                    )
+                    if classified_activity.activity_type != "UNKNOWN":
+                        new_ordered_activities.append(
+                            OrderedActivityItem(
+                                activity_type=classified_activity.activity_type,
+                                query_details=activity_str,
+                            )
+                        )
+                if new_ordered_activities:
+                    search_criteria.ordered_activities = new_ordered_activities
+                    updated = True
+                    logger.info(f"Обновлены активности: {[act.query_details for act in new_ordered_activities]}")
+
+        state["search_criteria"] = search_criteria # Убедимся, что изменения сохранены в state
+
+        if updated:
+            logger.info("Критерии успешно обновлены. Перепроверяем полноту данных.")
+            # Если что-то обновили, нужно снова проверить все ли есть
+            state["next_action"] = PossibleActions.EXTRACT_CRITERIA # Вернемся на проверку в check_and_ask_for_missing_criteria_node через роутер
+            state["is_awaiting_criteria_clarification"] = False # Сбросим флаг, чтобы check_and_ask_for_missing_criteria_node мог его установить заново
+            state["missing_criteria_fields"] = []
+            state["last_clarification_question"] = None
+            # Очистим кэш и текущий план, так как критерии изменились
+            state["cached_candidates"] = {}
+            state["current_plan"] = None
+            state["plan_builder_result"] = None
+            state["pinned_items"] = {}
+        else:
+            logger.info("Не удалось извлечь запрошенные критерии из ответа пользователя. Повторяем запрос.")
+            # Если ничего не обновили, значит, пользователь не дал нужной инфы,
+            # и мы снова отправим его на ASK_FOR_CRITERIA_CLARIFICATION через роутер
+            state["next_action"] = PossibleActions.ASK_FOR_CRITERIA_CLARIFICATION
+            # last_clarification_question и missing_criteria_fields остаются, чтобы задать тот же вопрос
+
+    except Exception as e:
+        logger.error(f"Ошибка при обработке уточнения критериев: {e}", exc_info=True)
+        state["error"] = "Произошла ошибка при обработке вашего уточнения. Пожалуйста, попробуйте еще раз."
+        # Если ошибка, пытаемся снова запросить
+        state["next_action"] = PossibleActions.ASK_FOR_CRITERIA_CLARIFICATION
+        state["chat_history"].append(AIMessage(content="Извините, я не смог обработать ваше уточнение. Пожалуйста, попробуйте переформулировать."))
+
+    return state
 
 
 async def _recalculate_all_route_segments(plan, state) -> None:
@@ -730,48 +1015,61 @@ async def process_start_address_node(state: AgentState) -> AgentState:
 
 async def router_node(state: AgentState) -> AgentState:
     """
-    Главный узел-оркестратор v8.2.
-    Логика проверки ожидания адреса вынесена на уровень графа,
-    поэтому этот узел стал проще и чище.
+    Главный узел-оркестратор v8.6.
+    Финальная версия с корректной "памятью" для предотвращения циклов.
     """
-    logger.info("--- УЗЕЛ: router_node ---")
+    logger.info("--- УЗЕЛ: router_node (v8.6) ---")
+
+    # --- КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: Запоминаем, какое действие привело нас сюда ---
+    # Это наша "память" о предыдущем шаге.
+    action_that_led_here = state.get("next_action")
+    logger.info(f"Роутер запущен после действия: {action_that_led_here}")
 
     # Очистка "одноразовых" полей
-    state["last_structured_command"] = None
     state["error"] = None
-    # --- ИЗМЕНЕНИЕ: Убираем блок if state.get("is_awaiting_start_address") ---
-    # Эта логика теперь обрабатывается в графе до вызова роутера.
+    state["classified_intent"] = None
 
-    # --- ИЕРАРХИЯ ПРИНЯТИЯ РЕШЕНИЙ (без изменений) ---
+    # --- ИЕРАРХИЯ ПРИНЯТИЯ РЕШЕНИЙ ---
+
+    # Приоритет 0: Обработка ожидания уточнений по критериям
+    if state.get("is_awaiting_criteria_clarification"):
+        logger.info(
+            "Приоритет 0: Обнаружен флаг is_awaiting_criteria_clarification. -> PROCESS_CRITERIA_CLARIFICATION"
+        )
+        state["next_action"] = PossibleActions.PROCESS_CRITERIA_CLARIFICATION
+        return state
+
+    classified_intent = state.get("classified_intent")
 
     # Приоритет 1: Новый запрос на ПОЛНОЕ перепланирование
-    classified_intent = state.get("classified_intent")
     if classified_intent and classified_intent.intent == UserIntent.PLAN_REQUEST:
         logger.info(
             "Приоритет 1: Получен новый PLAN_REQUEST. Полный сброс и переход к извлечению критериев."
         )
-        # Полная очистка старого контекста
+        # ... (этот блок без изменений)
         state["search_criteria"] = None
         state["cached_candidates"] = {}
         state["current_plan"] = None
         state["pinned_items"] = {}
         state["plan_builder_result"] = None
-        state["classified_intent"] = None
         state["user_start_address"] = None
         state["user_start_coordinates"] = None
         state["is_awaiting_start_address"] = False
+        state["is_awaiting_criteria_clarification"] = False
+        state["missing_criteria_fields"] = []
+        state["last_clarification_question"] = None
         state["next_action"] = PossibleActions.EXTRACT_CRITERIA
         return state
 
     # Приоритет 2: Новый ФИДБЕК на существующий план
     if classified_intent and classified_intent.intent == UserIntent.FEEDBACK_ON_PLAN:
         logger.info("Приоритет 2: Обнаружен FEEDBACK_ON_PLAN. -> ANALYZE_FEEDBACK")
-        state["classified_intent"] = None
         state["next_action"] = PossibleActions.ANALYZE_FEEDBACK
         return state
 
     # Приоритет 3: Обработка ОЧЕРЕДИ команд
     if command_queue := state.get("command_queue", []):
+        # ... (этот блок без изменений)
         command_type = command_queue[0].command
         logger.info(f"Приоритет 3: Обработка команды '{command_type}' из очереди.")
         action_map = {
@@ -792,6 +1090,7 @@ async def router_node(state: AgentState) -> AgentState:
 
     # Приоритет 4: Проверка на ФАТАЛЬНУЮ ошибку PlanBuilder
     if builder_result := state.get("plan_builder_result"):
+        # ... (этот блок без изменений)
         if builder_result.failure_reason:
             logger.error(
                 f"Приоритет 4: PlanBuilder не смог построить план. Причина: {builder_result.failure_reason}. -> PRESENT_RESULTS"
@@ -803,8 +1102,15 @@ async def router_node(state: AgentState) -> AgentState:
     # Приоритет 5: Стандартный путь построения/показа плана
     if not state.get("search_criteria"):
         state["next_action"] = PossibleActions.EXTRACT_CRITERIA
-    elif not state.get("cached_candidates"):
+    # --- КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: Используем "память" для разрыва цикла ---
+    elif action_that_led_here == PossibleActions.CHECK_CRITERIA:
+        # Если мы пришли сюда сразу после УСПЕШНОЙ проверки, значит,
+        # критерии полны и можно переходить к поиску.
+        logger.info("Критерии только что были успешно проверены. Переходим к поиску.")
         state["next_action"] = PossibleActions.SEARCH_EVENTS
+    elif not state.get("cached_candidates"):
+        # Если мы здесь не после проверки, и кэша нет, то отправляем на проверку.
+        state["next_action"] = PossibleActions.CHECK_CRITERIA
     elif not state.get("current_plan"):
         state["next_action"] = PossibleActions.BUILD_PLAN
     else:
@@ -813,16 +1119,34 @@ async def router_node(state: AgentState) -> AgentState:
     logger.info(f"Роутер решил: следующее действие -> {state['next_action'].value}")
     return state
 
-
 async def presenter_node(state: AgentState) -> AgentState:
-    logger.info("--- УЗЕЛ: presenter_node (v2.3) ---")
+    """
+    Представляет результаты пользователю.
+    Версия 2.4: Добавлена логика для отображения уточняющих вопросов.
+    """
+    logger.info("--- УЗЕЛ: presenter_node (v2.4) ---")
     state["plan_presented"] = False
     state["is_awaiting_start_address"] = False
     error = state.get("error")
     plan_to_show = state.get("current_plan")
     user_start_address = state.get("user_start_address")
+    chat_history = state.get("chat_history", [])
     response_text = ""
     llm = get_gigachat_client()
+
+    # --- НОВЫЙ БЛОК ПРОВЕРКИ ---
+    # Приоритет 0: Если последнее сообщение - это вопрос от ассистента,
+    # значит, нам не нужно ничего генерировать, а просто его показать.
+    if chat_history and isinstance(chat_history[-1], AIMessage):
+        # Проверяем, было ли это действие запросом на уточнение.
+        # Это предотвратит повторный вывод ответа, если presenter_node
+        # вызывается по другой причине.
+        if state.get("next_action") == PossibleActions.ASK_FOR_CRITERIA_CLARIFICATION:
+            logger.info("Presenter: Обнаружен готовый уточняющий вопрос. Ничего не генерируем, используем его.")
+            # Текст уже добавлен в chat_history в предыдущем узле,
+            # поэтому здесь просто выходим, ничего не делая.
+            return state
+
     if error:
         response_text = f"К сожалению, произошла ошибка: {error}"
     elif not plan_to_show:

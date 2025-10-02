@@ -18,8 +18,9 @@ class PossibleActions(str, Enum):
     DELETE_ACTIVITY = "DELETE_ACTIVITY"
     ADD_ACTIVITY = "ADD_ACTIVITY"
     PROCESS_START_ADDRESS = "PROCESS_START_ADDRESS"
-
-
+    ASK_FOR_CRITERIA_CLARIFICATION = "ASK_FOR_CRITERIA_CLARIFICATION" # Новое действие: запросить уточнение критериев
+    PROCESS_CRITERIA_CLARIFICATION = "PROCESS_CRITERIA_CLARIFICATION" # Новое действие: обработать уточнение критериев
+    CHECK_CRITERIA = "CHECK_CRITERIA"
 class RouteSegment(BaseModel):
     """Представляет один отрезок маршрута от одной точки до другой."""
 

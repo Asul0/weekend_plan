@@ -39,25 +39,23 @@ class AgentState(TypedDict):
     error: Optional[str]
     is_awaiting_clarification: Optional[str]
     plan_presented: bool
-    plan_warnings: List[str]  # <-- ДОБАВЛЕНО: Для некритичных предупреждений
-
-    # --- Поля для построения плана ---
+    plan_warnings: List[str]
     search_criteria: Optional[ExtractedInitialInfo]
     cached_candidates: DailyCache
     current_plan: Optional[Plan]
     plan_builder_result: Optional[PlanBuilderResult]
-
-    # --- Поля для обработки фидбека ---
     analyzed_feedback: Optional[AnalyzedFeedback]
     pinned_items: Dict[str, PlanItem]
     command_queue: List[ChangeRequest]
     sorting_preference: Optional[SortingPreference]
-    # --- Вспомогательные системные поля ---
     city_id_afisha: Optional[int]
     parsed_dates_iso: Optional[List[str]]
     parsed_end_dates_iso: Optional[List[str]]
     user_start_coordinates: Optional[dict]
     is_awaiting_address: bool
     status_message_id: Optional[Any]
-    user_start_address: Optional[str]        # <-- ДОБАВЛЕНО
+    user_start_address: Optional[str]        
     is_awaiting_start_address: bool
+    is_awaiting_criteria_clarification: bool # Флаг, что мы ждем уточнения по обязательным критериям
+    missing_criteria_fields: List[str] # Список полей, которые мы ожидаем получить (например, ['city', 'dates_description'])
+    last_clarification_question: Optional[str] # Последний вопрос, заданный пользователю для уточнения
